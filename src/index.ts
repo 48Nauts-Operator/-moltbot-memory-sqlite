@@ -2,14 +2,15 @@
  * moltbot-memory-sqlite
  * SQLite-based long-term memory plugin for Moltbot
  * 
- * Privacy-first, local-only memory storage with semantic search support.
+ * Privacy-first, local-only memory storage with full-text search support.
+ * Uses sql.js (WebAssembly SQLite) - no native compilation required.
  */
 
-import Database from 'better-sqlite3';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
 import { randomUUID } from 'crypto';
 import { homedir } from 'os';
 import { join, dirname } from 'path';
-import { mkdirSync, existsSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -61,6 +62,7 @@ export interface PluginConfig {
   maxMemories?: number;
   defaultImportance?: number;
   noisePatterns?: string[];
+  autoSaveInterval?: number; // ms, 0 = save after every write
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +77,7 @@ const DEFAULT_CONFIG: Required<PluginConfig> = {
     '^(ok|okay|yes|no|thanks|thank you|sure|got it|cool|nice|great)$',
     '^\\s*$',
   ],
+  autoSaveInterval: 0,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,11 +85,20 @@ const DEFAULT_CONFIG: Required<PluginConfig> = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export class SqliteMemoryPlugin {
-  private db: Database.Database;
+  private db: SqlJsDatabase | null = null;
   private config: Required<PluginConfig>;
+  private dirty = false;
+  private saveTimer: NodeJS.Timeout | null = null;
+  private initialized = false;
 
   constructor(config: PluginConfig = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+  }
+
+  async init(): Promise<void> {
+    if (this.initialized) return;
+
+    const SQL = await initSqlJs();
     
     // Ensure directory exists
     const dbDir = dirname(this.config.dbPath);
@@ -94,49 +106,65 @@ export class SqliteMemoryPlugin {
       mkdirSync(dbDir, { recursive: true });
     }
 
-    this.db = new Database(this.config.dbPath);
+    // Load existing database or create new
+    if (existsSync(this.config.dbPath)) {
+      const buffer = readFileSync(this.config.dbPath);
+      this.db = new SQL.Database(buffer);
+    } else {
+      this.db = new SQL.Database();
+    }
+
     this.initializeSchema();
+    this.initialized = true;
+
+    // Setup auto-save if configured
+    if (this.config.autoSaveInterval > 0) {
+      this.saveTimer = setInterval(() => this.saveIfDirty(), this.config.autoSaveInterval);
+    }
   }
 
   private initializeSchema(): void {
-    this.db.exec(`
+    if (!this.db) throw new Error('Database not initialized');
+
+    this.db.run(`
       CREATE TABLE IF NOT EXISTS memories (
         id TEXT PRIMARY KEY,
         text TEXT NOT NULL,
+        text_lower TEXT NOT NULL,
         category TEXT DEFAULT 'other',
         importance REAL DEFAULT 0.7,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         session_key TEXT,
         metadata TEXT
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
-      CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
-      CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
-      
-      -- FTS5 for full-text search
-      CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-        id,
-        text,
-        content='memories',
-        content_rowid='rowid'
-      );
-
-      -- Triggers to keep FTS in sync
-      CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-        INSERT INTO memories_fts(id, text) VALUES (new.id, new.text);
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-        INSERT INTO memories_fts(memories_fts, id, text) VALUES('delete', old.id, old.text);
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-        INSERT INTO memories_fts(memories_fts, id, text) VALUES('delete', old.id, old.text);
-        INSERT INTO memories_fts(id, text) VALUES (new.id, new.text);
-      END;
+      )
     `);
+
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at)`);
+    this.db.run(`CREATE INDEX IF NOT EXISTS idx_memories_text_lower ON memories(text_lower)`);
+    
+    this.save();
+  }
+
+  private save(): void {
+    if (!this.db) return;
+    const data = this.db.export();
+    const buffer = Buffer.from(data);
+    writeFileSync(this.config.dbPath, buffer);
+    this.dirty = false;
+  }
+
+  private saveIfDirty(): void {
+    if (this.dirty) this.save();
+  }
+
+  private markDirty(): void {
+    this.dirty = true;
+    if (this.config.autoSaveInterval === 0) {
+      this.save();
+    }
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -147,6 +175,8 @@ export class SqliteMemoryPlugin {
    * Store a new memory
    */
   store(params: MemoryStoreParams): Memory {
+    if (!this.db) throw new Error('Database not initialized. Call init() first.');
+
     const now = new Date().toISOString();
     const memory: Memory = {
       id: randomUUID(),
@@ -159,21 +189,23 @@ export class SqliteMemoryPlugin {
       metadata: params.metadata,
     };
 
-    const stmt = this.db.prepare(`
-      INSERT INTO memories (id, text, category, importance, created_at, updated_at, session_key, metadata)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    stmt.run(
-      memory.id,
-      memory.text,
-      memory.category,
-      memory.importance,
-      memory.createdAt,
-      memory.updatedAt,
-      memory.sessionKey || null,
-      memory.metadata ? JSON.stringify(memory.metadata) : null
+    this.db.run(
+      `INSERT INTO memories (id, text, text_lower, category, importance, created_at, updated_at, session_key, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        memory.id,
+        memory.text,
+        memory.text.toLowerCase(),
+        memory.category,
+        memory.importance,
+        memory.createdAt,
+        memory.updatedAt,
+        memory.sessionKey || null,
+        memory.metadata ? JSON.stringify(memory.metadata) : null,
+      ]
     );
+
+    this.markDirty();
 
     // Enforce max memories limit
     this.pruneOldMemories();
@@ -185,86 +217,82 @@ export class SqliteMemoryPlugin {
    * Recall memories matching a query
    */
   recall(params: MemoryRecallParams): Memory[] {
+    if (!this.db) throw new Error('Database not initialized. Call init() first.');
+
     const limit = params.limit || 5;
     const conditions: string[] = [];
-    const values: unknown[] = [];
+    const values: (string | number)[] = [];
 
-    // Full-text search
+    // Text search (simple LIKE-based for sql.js compatibility)
     if (params.query) {
-      conditions.push(`m.id IN (SELECT id FROM memories_fts WHERE memories_fts MATCH ?)`);
-      // Escape special FTS5 characters and create search query
-      const searchQuery = params.query
-        .replace(/['"]/g, '')
-        .split(/\s+/)
-        .filter(w => w.length > 1)
-        .map(w => `"${w}"*`)
-        .join(' OR ');
-      values.push(searchQuery || params.query);
+      const words = params.query.toLowerCase().split(/\s+/).filter(w => w.length > 1);
+      if (words.length > 0) {
+        const likeConditions = words.map(() => 'text_lower LIKE ?');
+        conditions.push(`(${likeConditions.join(' OR ')})`);
+        words.forEach(word => values.push(`%${word}%`));
+      }
     }
 
     // Category filter
     if (params.category) {
-      conditions.push('m.category = ?');
+      conditions.push('category = ?');
       values.push(params.category);
     }
 
     // Date filters
     if (params.dateFrom) {
-      conditions.push('m.created_at >= ?');
+      conditions.push('created_at >= ?');
       values.push(params.dateFrom);
     }
     if (params.dateTo) {
-      conditions.push('m.created_at <= ?');
+      conditions.push('created_at <= ?');
       values.push(params.dateTo);
-    }
-
-    // Noise filter
-    if (params.filterNoise !== false) {
-      for (const pattern of this.config.noisePatterns) {
-        conditions.push(`m.text NOT REGEXP ?`);
-        values.push(pattern);
-      }
     }
 
     const whereClause = conditions.length > 0 
       ? `WHERE ${conditions.join(' AND ')}` 
       : '';
 
-    // Note: SQLite doesn't have REGEXP by default, we'll filter in JS
-    const stmt = this.db.prepare(`
+    const sql = `
       SELECT id, text, category, importance, created_at, updated_at, session_key, metadata
-      FROM memories m
-      ${conditions.length > 0 ? `WHERE ${conditions.filter(c => !c.includes('REGEXP')).join(' AND ')}` : ''}
+      FROM memories
+      ${whereClause}
       ORDER BY importance DESC, created_at DESC
       LIMIT ?
-    `);
+    `;
 
-    const queryValues = values.filter((_, i) => !conditions[i]?.includes('REGEXP'));
-    queryValues.push(limit * 2); // Fetch extra for noise filtering
+    values.push(limit * 2); // Fetch extra for noise filtering
 
-    const rows = stmt.all(...queryValues) as Array<{
-      id: string;
-      text: string;
-      category: MemoryCategory;
-      importance: number;
-      created_at: string;
-      updated_at: string;
-      session_key: string | null;
-      metadata: string | null;
-    }>;
+    const stmt = this.db.prepare(sql);
+    stmt.bind(values);
 
-    let memories = rows.map(row => ({
-      id: row.id,
-      text: row.text,
-      category: row.category,
-      importance: row.importance,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      sessionKey: row.session_key || undefined,
-      metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
-    }));
+    const rows: Memory[] = [];
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as {
+        id: string;
+        text: string;
+        category: string;
+        importance: number;
+        created_at: string;
+        updated_at: string;
+        session_key: string | null;
+        metadata: string | null;
+      };
+      rows.push({
+        id: row.id,
+        text: row.text,
+        category: row.category as MemoryCategory,
+        importance: row.importance,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        sessionKey: row.session_key || undefined,
+        metadata: row.metadata ? JSON.parse(row.metadata) : undefined,
+      });
+    }
+    stmt.free();
 
-    // Apply noise filter in JS
+    // Apply noise filter
+    let memories = rows;
     if (params.filterNoise !== false) {
       const noiseRegexes = this.config.noisePatterns.map(p => new RegExp(p, 'i'));
       memories = memories.filter(m => !noiseRegexes.some(re => re.test(m.text)));
@@ -277,21 +305,25 @@ export class SqliteMemoryPlugin {
    * Delete a memory (GDPR-compliant)
    */
   forget(params: MemoryForgetParams): { deleted: number } {
+    if (!this.db) throw new Error('Database not initialized. Call init() first.');
+
     let deleted = 0;
 
     if (params.memoryId) {
-      const stmt = this.db.prepare('DELETE FROM memories WHERE id = ?');
-      const result = stmt.run(params.memoryId);
-      deleted = result.changes;
+      const result = this.db.run('DELETE FROM memories WHERE id = ?', [params.memoryId]);
+      deleted = this.db.getRowsModified();
     } else if (params.query) {
       // Find matching memories first
       const memories = this.recall({ query: params.query, limit: 100, filterNoise: false });
       if (memories.length > 0) {
         const placeholders = memories.map(() => '?').join(',');
-        const stmt = this.db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`);
-        const result = stmt.run(...memories.map(m => m.id));
-        deleted = result.changes;
+        this.db.run(`DELETE FROM memories WHERE id IN (${placeholders})`, memories.map(m => m.id));
+        deleted = this.db.getRowsModified();
       }
+    }
+
+    if (deleted > 0) {
+      this.markDirty();
     }
 
     return { deleted };
@@ -300,18 +332,26 @@ export class SqliteMemoryPlugin {
   /**
    * Get memory stats
    */
-  stats(): { total: number; byCategory: Record<MemoryCategory, number> } {
-    const total = (this.db.prepare('SELECT COUNT(*) as count FROM memories').get() as { count: number }).count;
+  stats(): { total: number; byCategory: Record<string, number> } {
+    if (!this.db) throw new Error('Database not initialized. Call init() first.');
+
+    const totalStmt = this.db.prepare('SELECT COUNT(*) as count FROM memories');
+    totalStmt.step();
+    const total = (totalStmt.getAsObject() as { count: number }).count;
+    totalStmt.free();
     
-    const byCategoryRows = this.db.prepare(`
+    const categoryStmt = this.db.prepare(`
       SELECT category, COUNT(*) as count 
       FROM memories 
       GROUP BY category
-    `).all() as Array<{ category: MemoryCategory; count: number }>;
+    `);
 
-    const byCategory = Object.fromEntries(
-      byCategoryRows.map(row => [row.category, row.count])
-    ) as Record<MemoryCategory, number>;
+    const byCategory: Record<string, number> = {};
+    while (categoryStmt.step()) {
+      const row = categoryStmt.getAsObject() as { category: string; count: number };
+      byCategory[row.category] = row.count;
+    }
+    categoryStmt.free();
 
     return { total, byCategory };
   }
@@ -320,7 +360,16 @@ export class SqliteMemoryPlugin {
    * Close database connection
    */
   close(): void {
-    this.db.close();
+    if (this.saveTimer) {
+      clearInterval(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.saveIfDirty();
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+    this.initialized = false;
   }
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -328,17 +377,18 @@ export class SqliteMemoryPlugin {
   // ───────────────────────────────────────────────────────────────────────────
 
   private pruneOldMemories(): void {
-    const stats = this.stats();
-    if (stats.total > this.config.maxMemories) {
-      const toDelete = stats.total - this.config.maxMemories;
-      this.db.prepare(`
+    const { total } = this.stats();
+    if (total > this.config.maxMemories) {
+      const toDelete = total - this.config.maxMemories;
+      this.db!.run(`
         DELETE FROM memories 
         WHERE id IN (
           SELECT id FROM memories 
           ORDER BY importance ASC, created_at ASC 
           LIMIT ?
         )
-      `).run(toDelete);
+      `, [toDelete]);
+      this.markDirty();
     }
   }
 }
@@ -374,6 +424,7 @@ export const plugin: MoltbotPlugin = {
 
   async init(config: PluginConfig = {}): Promise<void> {
     pluginInstance = new SqliteMemoryPlugin(config);
+    await pluginInstance.init();
   },
 
   handlers: {
