@@ -142,11 +142,21 @@ CREATE TABLE memories (
 );
 ```
 
+## Why sql.js?
+
+Uses [sql.js](https://github.com/sql-js/sql.js) (SQLite compiled to WebAssembly):
+
+- ✅ Works on any Node.js version (including v25+)
+- ✅ No native compilation or build tools needed
+- ✅ macOS, Linux, Windows, ARM, x86
+- ✅ Truly portable
+
 ## License
 
 MIT © Andre Wolke
 
 ## Links
 
+- [Full Documentation (Gist)](https://gist.github.com/48Nauts-Operator/6d2be91208de723ca26fcbbb29ccd4b5)
 - [Moltbot](https://github.com/moltbot/moltbot)
-- [Blog Post: Your AI's Memory Shouldn't Phone Home](https://21nauts.com/blog/ai-memory-privacy)
+- [21nauts](https://21nauts.com)
